@@ -4,10 +4,10 @@ Orion will start and configure on the fly a Grid Engine cluster backed on Amazon
 
 ## Getting Started
 
-Install AWS command line interface tools
-Clone orion
-Specify in orion.config your AWS public key name and the location of the private key on your computer
-Create your first cluster
+* Install AWS command line interface tools
+* Clone orion
+* Specify in orion.config your AWS public key name and the location of the private key on your computer
+* Create your first cluster
 
 ### Prerequisites
 
