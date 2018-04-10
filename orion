@@ -1,0 +1,563 @@
+#!/usr/bin/env bash
+################################################################################
+## Reading the config file
+################################################################################
+## Read the config file
+if [ ! -f 'SuperNova.config' ];then
+    echo "Could not find the SuperNova.config configuration file"
+    exit
+elif [[ $1 -eq '-d']] && [[ -f $2 ]]; then
+    source $2
+else
+    source SuperNova.config
+fi
+
+
+if [[ -z "$region" ]] && [[ copyAWS_CLI_config == 'yes' ]];then
+    region=$(aws configure --profile $profile get region)
+fi
+if [[ -z "$accessKey" ]] && [[ copyAWS_CLI_config == 'yes' ]];then
+    region=$(aws configure --profile $profile get aws_access_key_id)
+fi
+if [[ -z "$secretKey" ]] && [[ copyAWS_CLI_config == 'yes' ]];then
+    region=$(aws configure --profile $profile get aws_secret_access_key)
+fi
+
+start () {
+    ################################################################################
+    ## TODO: Implement command line argument parssing
+    ## TODO: Test for ressources availability
+    ## TODO: Test for valid ressouces from argumetns
+    ################################################################################
+    LIMIT=9
+    
+    ## if region is not set in the config, get it from the aws config
+    if [[ -z $region ]]; then
+	region=$(aws configure get region)
+	if [[ -z $region ]]; then
+	    echo No region have been set, either run aws configure or put it in the config file
+	    exit
+	fi
+    fi
+    
+    ## TODO: NEED TO GET LIMITS SET
+    if [ $workerNumber -gt $LIMIT ]; then
+	echo "You can't lunch more than $LIMIT nodes"
+	exit
+    fi
+    
+    ################################################################################
+    ## Now the engine
+    ################################################################################
+    ## dealing with the security groups first
+    ################################################################################
+    echo "Configuring the Security Groups"
+
+    ## Do I have an EFS-SGE security groupt
+    efsSec=$(aws ec2 describe-security-groups \
+		 --query "SecurityGroups[?GroupName == '$efsGrpName'].GroupId" \
+		 --output text)
+    
+    ## If I don't let's create one
+    if [[ -z $efsSec ]]; then
+	##Create a new securiy group for EC2
+	efsSec=$(aws ec2 create-security-group \
+		     --group-name $efsGrpName \
+		 --description "EC2 security for NFS/SGE cluster" \
+		 --query "GroupId" \
+		 --output text
+	      )
+    fi
+    
+    ## Check for port open to the world
+    for port in 22 6444 6445;do
+	portOn=$(aws ec2 describe-security-groups \
+		     --group-ids $efsSec \
+		     --filters \
+		     Name=ip-permission.from-port,Values=$port \
+		     Name=ip-permission.to-port,Values=$port \
+		     Name=ip-permission.cidr,Values='0.0.0.0/0' \
+		     --query 'SecurityGroups[*].{Name:GroupName}' \
+		     --output text)			    
+	
+	if [[ -z $portOn ]];then
+	    aws ec2 authorize-security-group-ingress \
+		--group-id $efsSec \
+		--protocol tcp \
+		--port $port \
+		--cidr 0.0.0.0/0 
+	fi
+    done
+    
+    ## Need to open port to for self security group
+    for port in 2049 6444 6445;do
+	portOn=$(aws ec2 describe-security-groups \
+		     --group-ids $efsSec \
+		     --filters \
+		     Name=ip-permission.from-port,Values=$port \
+		     Name=ip-permission.to-port,Values=$port \
+		     Name=ip-permission.group-id,Values=$efsSec \
+		     --query 'SecurityGroups[*].{Name:GroupName}' \
+		     --output text)
+	if [[ -z $portOn ]];then
+	    aws ec2 authorize-security-group-ingress \
+		--group-id $efsSec \
+		--protocol tcp \
+		--port $port \
+		--source-group $efsSec
+	fi
+    done
+
+    ################################################################################
+    ## Creating the master node
+    ################################################################################
+    ## Firing up master
+    masterID=$(aws ec2 run-instances \
+		   --image-id $AMI \
+		   --associate-public-ip-address \
+		   --key-name "$KeyPair" \
+		   --security-group-ids $efsSec \
+		   --instance-type $masterInstanceType \
+		   --query 'Instances[*].InstanceId' \
+		   --output text \
+		   --count 1
+	    )
+
+    echo Initializing master instance, waiting for it to be up and running
+    waitForState 'running' "$masterID"
+
+    ## Tag Instances and collect their IP address
+    aws ec2 create-tags \
+	--resources $masterID \
+	--tags Key=Name,Value="$instanceName-master"
+    
+    ## Gatter the instances public IPs
+    masterIP=$(aws ec2 describe-instances \
+		   --instance-ids $masterID \
+		   --output text \
+		   --query 'Reservations[*].Instances[*].PublicIpAddress'
+	    )
+    
+    _writeVars masterID masterIP
+    
+    ## Get the subnet of the Master and spin instances in same subnet
+    subnetID=$(aws ec2 describe-instances \
+		   --instance-ids $masterID \
+		   --query 'Reservations[*].Instances[*].SubnetId' \
+		   --output text
+	    )
+
+    ################################################################################
+    ## Creating the workers
+    ################################################################################
+    if [[ $workerNumber -gt 0 ]]; then
+	workerIDs=($(aws ec2 run-instances \
+			 --image-id $AMI \
+			 --instance-type $workerInstanceType \
+			 --count $workerNumber \
+			 --associate-public-ip-address \
+			 --key-name "$KeyPair" \
+			 --security-group-ids $efsSec \
+			 --subnet-id $subnetID \
+			 --output text \
+			 --query 'Instances[*].InstanceId'
+		   ))
+
+	## Waiting for all workers  to be running    
+	waitForState 'running' "${workerIDs[@]}"
+	
+	nodeIDs=()
+	i=1
+	for node in "${workerIDs[@]}"; do
+	    nodeIDs+=($(printf "node%03d\n" $i))
+	    aws ec2 create-tags \
+		--resources $node \
+		--tags Key=Name,Value=$(printf "${instanceName}-node%03d\n" $i)
+	    
+	    workerIPs+=($(aws ec2 describe-instances \
+			    --instance-ids $node\
+			    --output text \
+			    --query 'Reservations[*].Instances[*].PublicIpAddress'
+		      ))
+	    
+	    ((i++))
+	done
+	_writeVars workerIDs workerIPs
+    fi
+    
+    ################################################################################
+    ## Waiting for all instance to be reachable
+    ################################################################################
+    echo Waiting for the SSH server to be up and running
+    while [[ -z $f ]] && [[ $f != 1 ]]; do
+	unset f
+	for ip in $masterIP "${workerIPs[@]}"; do
+	    if nc -zv -w 1 $ip 22 2>&1 | grep -q succeeded; then
+		f+=(1)
+	    else
+		f+=(0)
+		echo -n .
+		sleep 0.5
+	    fi
+	done
+	f=$(echo ${f[@]}|tr ' ' '\n'|sort | uniq)
+    done
+    echo ""
+
+    ################################################################################
+    ## Now configuring the EFS
+    ################################################################################
+    echo "Configuring the EFS"
+    ## If no EFS Id have been specifed, create one
+    if [[ -z $efsID ]]; then
+	efsID=$(aws efs create-file-system \
+		    --creation-token $instanceName-efs-$RANDOM \
+		    --region $region \
+		    --query 'FileSystemId' \
+		    --output text
+	     )
+	i=0
+	echo "waiting on the EFS to be up, may take more than two minutes"
+	while [[ -z $fsState ]] && [[ $fsState != 'available' ]];do
+	    echo -n "."
+	    if [[ $i > 60 ]];then
+		echo "Can't create EFS. System timed out"
+		exit
+	    else
+		fsState=$(aws efs describe-file-systems \
+			      --query "FileSystems[?FileSystemId == '$efsID'].LifeCycleState" \
+			      --output text
+		       )
+	    fi
+	    ## Once FS is available, set the tags
+	    if [[ $fsState != 'available' ]]; then
+		aws efs create-tags \
+		    --file-system-id $efsID \
+		    --tags Key=Name,Value="${instanceName}-EFS" \
+		    --region $region
+	    fi
+	    sleep 1
+	    ((i++))
+	    
+	done
+	echo ""
+    fi
+    
+    ## Is there mount targets on the subnet?
+    mntID=$(aws efs describe-mount-targets \
+		--file-system-id $efsID \
+		--query "MountTargets[?SubnetId == '$subnetID'].MountTargetId" \
+		--output text
+	 )
+    
+    ## If $mntID as not been define, then create a new mount target in my subnet
+    if [ -z "$mntID" ]; then
+	echo "Creating a mount target for the efs $efsID"
+	## Create a Mount target in our zone
+	mntID=$(aws efs create-mount-target \
+		    --file-system-id $efsID \
+		    --subnet-id  $subnetID \
+		    --security-group $efsSec \
+		    --output text \
+		    --query MountTargetId
+	     )
+	_writeVars mntID
+    else
+	## test for security group on the mount ID
+	efsSecGrps=($(aws efs describe-mount-target-security-groups \
+			  --mount-target-id $mntID \
+			  --query 'SecurityGroups[*]' \
+			  --output text
+		    ))
+	if [[ $efsSecGrps != *$efsSec* ]];then
+	    if [[ "${#efsSecGrps[@]}" > 4 ]];then
+		echo "Too many security group on efs $efsID"
+		exit
+	    else 
+		aws efs modify-mount-target-security-groups \
+		    --mount-target-id $mntID \
+		    --security-groups $efsSEcGrps $efsSec
+	    fi
+	fi
+    fi
+
+    ## fetch the IP of the EFS server
+    mntIP=$(aws efs describe-mount-targets \
+		--mount-target-id $mntID \
+		--query "MountTargets[*].IpAddress" \
+		--output text
+	 )    
+
+    ################################################################################
+    ## Configuring the different instances
+    ################################################################################
+    echo "Configuring nodes"
+    
+    mkdir -p ./logs
+    ## First Config the master node
+    source ./configOSMaster.sh $masterIP $mntIP 'master' "$masterIP ${workerIPs[*]}" "master ${nodeIDs[*]}" \
+	|tee ./logs/masterOS.log
+    ## Now do update the nodes in parallel
+    for (( i=0; $i<${#nodeIDs[@]}; i++));do
+	source ./configOSNodes.sh ${workerIPs[$i]} $mntIP ${nodeIDs[$i]} "$masterIP ${workerIPs[*]}" "master ${nodeIDs[*]}" \
+	    |tee ./logs/${nodeID[$i]}.log &
+    done
+    wait
+    
+    ################################################################################
+    ## Now configuring SGE
+    ################################################################################
+    ## First master
+    source ./configSGEMaster.sh $masterIP 'master' "$masterIP ${workerIPs[*]}" "master ${nodeIDs[*]}"
+    ## Is master also a worker?
+    if [[ $isMasterAworker -eq 1 ]]; then
+	for ip in $masterIP "${workerIPs[@]}" ;do
+	    source ./configSGEWorkers.sh $ip &
+	done
+	wait
+	source ./addWorkers.sh $masterIP "$masterIP ${workerIPs[*]}" "master ${nodeIDs[*]}"
+    else
+	for ip in "${workerIPs[@]}" ;do
+	    source ./configSGEWorkers.sh $ip &
+	done
+	wait
+	source ./addWorkers.sh $masterIP "${workerIPs[*]}" "${nodeIDs[*]}"
+    fi
+
+    ################################################################################
+    ## DONE!
+    ################################################################################
+    ## Power cycle the gridengine service on all nodes
+    ssh -i $privateKey -q -o StrictHostKeyChecking=no ubuntu@$masterIP <<'EOF'
+rm -f ~/.ssh/known_hosts
+
+for node in $(qconf -shgrp @allhosts | grep hostlist| cut -d" " -f2-); do
+     ssh -i $privateKey -q -o StrictHostKeyChecking=no $node 'sudo service gridengine-exec restart'
+done
+EOF
+
+
+    echo "You can ssh the master node by $0 sshMaster"
+    
+}
+
+
+restart () {
+
+    _readVars
+
+    IDs=($masterID "${workderIDs[@]}")
+    
+    if [[ -z $IDs ]]; then
+	echo No cluster configured, nothing to restart
+	echo Start cluster by $0 start
+	exit
+    else
+        echo "Restarting cluster"
+    fi
+        
+    states=$(aws ec2 describe-instances \
+		  --instance-ids ${IDs[@]} \
+		  --query "Reservations[*].Instances[*].State.Name" \
+		  --out text
+	    )
+    states=($(echo $states))
+    
+    ## Find the instances that are stopped
+    for ((i=0;i<${#IDs[@]};i++));do
+	if [[ ${states[$i]} == 'stopped' ]]; then
+	    toRestart+=(${IDs[$i]})
+	fi
+    done
+    
+    ## restart instances
+    newState=($(aws ec2 start-instances \
+	    --instance-ids ${toRestart[@]} \
+	    --query "StartingInstances[*].CurrentState.Name" \
+	    --out text
+	      ))
+    
+    ##Could test if all instances new state are pending...
+    
+    ## Waiting for all workers  to be running
+    waitForState running "@{toRestart[@]}"
+
+    ## Gatter the instances public IPs
+    masterIP=$(aws ec2 describe-instances \
+		   --instance-ids $masterID \
+		   --output text \
+		   --query 'Reservations[*].Instances[*].PublicIpAddress'
+	    )
+    
+    if [[ ${#workderIDs[@]} -gt 0 ]]; then
+	nodeIDs=()
+	i=1
+	for node in "${workerIDs[@]}"; do
+	    nodeIDs+=($(printf "node%03d\n" $i))
+	    aws ec2 create-tags \
+		--resources $node \
+		--tags Key=Name,Value=$(printf "${instanceName}-node%03d\n" $i)
+	    
+	    workerIPs+=($(aws ec2 describe-instances \
+			    --instance-ids $node\
+			    --output text \
+			    --query 'Reservations[*].Instances[*].PublicIpAddress'
+		      ))
+	    
+	    ((i++))
+	done
+    fi
+    
+    echo Waiting for the SSH server to be up and running
+    while [[ -z $f ]] && [[ $f != 1 ]]; do
+	unset f
+	for ip in $masterIP "${workerIPs[@]}"; do
+	    if nc -zv -w 1 $ip 22 2>&1 | grep -q succeeded; then
+		f+=(1)
+	    else
+		f+=(0)
+		echo -n .
+		sleep 0.5
+	    fi
+	done
+	f=$(echo ${f[@]}|tr ' ' '\n'|sort | uniq)
+    done
+    echo ""
+
+    ## Repopulate the /etc/hosts accross the cluster
+    echo "Replacing entry in /etc/hosts with new IP addresses"
+    IDs=('master' "${nodeIDs[@]}")
+    IPs=($masterIP "${workerIPs[@]}")    
+    for ip in "${IPs[@]}";do
+	ssh="ssh -i $privateKey -q -o StrictHostKeyChecking=no ubuntu@$ip"
+	for (( i=0;$i<${#IDs[@]};i++ ));do
+	    $ssh "sudo sed -Ei \"s/^([0-9]+\.){3}[0-9]+ ${IDs[$i]}/${IPs[$i]} ${IDs[$i]}/\" /etc/hosts"
+	done
+    done
+
+    _writeVars masterIP workerIPs
+
+    echo "You can ssh the master node by $0 sshMaster"
+}
+
+waitForState () {
+    state=$1
+    shift
+    ## Waiting for all workers  to be running
+    echo Waiting for all instance to be $state
+    
+    while [[ -z $states ]] || [[ $states != "$state" ]]; do
+	states=$(aws ec2 describe-instances \
+		     --instance-ids "$@" \
+		     --output text \
+		     --query 'Reservations[*].Instances[*].State.Name')
+	states=$(echo $states | tr ' ' '\n' | sort | uniq)
+	sleep 0.5
+	echo -n '.'
+    done      
+    echo ""
+    echo "All instances are $state"
+}
+
+
+stop () {
+    
+    _readVars
+
+    IDs=($masterID "${workerIDs[@]}")
+    
+    if [[ -z $IDs ]]; then
+	echo No cluster configure, nothing to stop
+	exit
+    else
+        echo "Stopping instances"
+    fi
+    
+    ## restart instances
+    newState=($(aws ec2 stop-instances \
+	    --instance-ids "${IDs[@]}" \
+	    --query "StartingInstances[*].CurrentState.Name" \
+	    --out text
+	      ))
+
+    waitForState 'stopped' "${IDs[@]}"
+    
+}
+
+
+destroy () {
+
+    _readVars
+   
+    IDs=($masterID "${workerIDs[@]}")
+    
+    if [[ -z $IDs ]]; then
+	echo No cluster configure, nothing to stop
+	exit
+    else
+	echo "Destroying all instances"
+    fi
+    
+    ## restart instances
+    newState=($(aws ec2 terminate-instances \
+	    --instance-ids "${IDs[@]}" \
+	    --query "StartingInstances[*].CurrentState.Name" \
+	    --out text
+	      ))
+
+    waitForState terminated "${IDs[@]}"
+    
+    ## Removing files from config
+    rm -rf .config/*
+
+    echo "All instances have been destroyed"
+}
+
+
+sshMaster () {
+    
+    _readVars
+
+    state=$(aws ec2 describe-instances \
+		 --instance-ids "$masterID" \
+		 --output text \
+		 --query 'Reservations[*].Instances[*].State.Name')
+    
+    if [[ -z $state ]];then
+	echo "Can't ssh to master node, cluster does not exist. Run $0 start first"
+    elif [[ $state == 'running' ]];then
+	ssh -i $privateKey ubuntu@$masterIP
+    else
+	echo "Can't ssh to master node, instance is $state"
+    fi
+    
+}
+
+_writeVars (){
+    mkdir -p .config
+    for varName in "$@";do
+	file=.config/${varName}.conf
+	cp -f /dev/null $file 
+	eval var=\${$varName[@]}
+	for i in $var; do
+	    echo $i >> $file
+	done
+    done
+}
+
+_readVars () {
+    for f in .config/*.conf; do
+	var=$(basename "${f%.*}")
+	if [[ $(cat $f | wc -l) -gt 1 ]];then
+	    IFS=$'\n' eval "$var=($(cat $f))"
+	else
+	    eval "$var=$(cat $f)"
+	fi
+    done
+}
+
+
+################################################################################
+### Scripts call functions passing parameters (that have yet to be implemated
+################################################################################
+FUNC_CALL=$1; shift; $FUNC_CALL "$@"
