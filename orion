@@ -3,13 +3,13 @@
 ## Reading the config file
 ################################################################################
 ## Read the config file
-if [ ! -f 'SuperNova.config' ];then
-    echo "Could not find the SuperNova.config configuration file"
+if [ ! -f "$0.config" ];then
+    echo "Could not find the $0.config configuration file"
     exit
 elif [[ $1 -eq '-d']] && [[ -f $2 ]]; then
     source $2
 else
-    source SuperNova.config
+    source "$0.config"
 fi
 
 
